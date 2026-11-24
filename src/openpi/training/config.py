@@ -5,6 +5,7 @@ from collections.abc import Sequence
 import dataclasses
 import difflib
 import logging
+import os
 import pathlib
 from typing import Any, Literal, Protocol, TypeAlias
 
@@ -20,6 +21,7 @@ import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
+import openpi.policies.mujoco_panda_policy as mujoco_panda_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
@@ -28,6 +30,7 @@ import openpi.training.misc.roboarena_config as roboarena_config
 import openpi.training.optimizer as _optimizer
 import openpi.training.weight_loaders as weight_loaders
 import openpi.transforms as _transforms
+
 
 ModelType: TypeAlias = _model.ModelType
 # Work around a tyro issue with using nnx.filterlib.Filter directly.
@@ -65,6 +68,7 @@ class AssetsConfig:
 class DataConfig:
     # LeRobot repo id. If None, fake data will be created.
     repo_id: str | None = None
+    dataset_root: str | None = None
     # Directory within the assets directory containing the data assets.
     asset_id: str | None = None
     # Contains precomputed normalization stats. If None, normalization will not be performed.
@@ -167,6 +171,7 @@ class ModelTransformFactory(GroupFactory):
 class DataConfigFactory(abc.ABC):
     # The LeRobot repo id.
     repo_id: str = tyro.MISSING
+    dataset_root: str | None = None
     # Determines how the assets will be loaded.
     assets: AssetsConfig = dataclasses.field(default_factory=AssetsConfig)
     # Base config that will be updated by the factory.
@@ -182,6 +187,7 @@ class DataConfigFactory(abc.ABC):
         return dataclasses.replace(
             self.base_config or DataConfig(),
             repo_id=repo_id,
+            dataset_root=self.dataset_root,
             asset_id=asset_id,
             norm_stats=self._load_norm_stats(epath.Path(self.assets.assets_dir or assets_dirs), asset_id),
             use_quantile_norm=model_config.model_type != ModelType.PI0,
@@ -352,6 +358,52 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
+        )
+@dataclasses.dataclass(frozen=True)
+class LeRobotMujocoPandaDataConfig(DataConfigFactory):
+    """Data configuration for the single-arm MuJoCo Panda dataset."""
+
+    @override
+    def create(
+        self,
+        assets_dirs: pathlib.Path,
+        model_config: _model.BaseModelConfig,
+    ) -> DataConfig:
+        # 将HF数据集字段名转换成MujocoPandaInputs期望的字段名。
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/overview": "observation.images.overview",
+                        "observation/state": "observation.state",
+                        "actions": "action",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+
+        # 训练输入和推理输出使用你刚写的适配器。
+        data_transforms = _transforms.Group(
+            inputs=[mujoco_panda_policy.MujocoPandaInputs()],
+            outputs=[mujoco_panda_policy.MujocoPandaOutputs()],
+        )
+
+        # OpenPI官方模型处理：
+        # 图像resize到224×224、prompt分词、S9/A7补齐到32维。
+        model_transforms = ModelTransformFactory()(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(
+                assets_dirs,
+                model_config,
+            ),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            # HF原始动作字段名是action，不是actions。
+            action_sequence_keys=("action",),
+            prompt_from_task=True,
         )
 
 
@@ -760,6 +812,23 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         pytorch_weight_path="/path/to/your/pytorch_weight_path",
         num_train_steps=30_000,
+    ),
+    TrainConfig(
+        name="pi05_mujoco_panda_pick",
+        # 使用π0.5模型。
+        model=pi0_config.Pi0Config(pi05=True),
+        # 使用我们的单臂Panda数据适配器。
+        data=LeRobotMujocoPandaDataConfig(
+            repo_id="shuyisong07/merged_data",
+            # 服务器以后通过环境变量告诉程序数据放在哪里。
+            dataset_root=os.environ.get("MUJOCO_PANDA_DATA_ROOT"),
+        ),
+        # 从官方π0.5基础权重开始微调。
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_base/params"
+        ),
+        num_train_steps=20_000,
+        batch_size=32,
     ),
     #
     # Fine-tuning Aloha configs.
