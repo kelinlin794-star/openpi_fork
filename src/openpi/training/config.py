@@ -816,7 +816,11 @@ _CONFIGS = [
     TrainConfig(
         name="pi05_mujoco_panda_pick",
         # 使用π0.5模型。
-        model=pi0_config.Pi0Config(pi05=True),
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
         # 使用我们的单臂Panda数据适配器。
         data=LeRobotMujocoPandaDataConfig(
             repo_id="shuyisong07/merged_data",
@@ -827,8 +831,16 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader(
             "gs://openpi-assets/checkpoints/pi05_base/params"
         ),
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+
+        # 与官方LoRA示例一致，关闭额外的EMA参数副本。
+        ema_decay=None,
         num_train_steps=20_000,
-        batch_size=32,
+        batch_size=1,
     ),
     #
     # Fine-tuning Aloha configs.
