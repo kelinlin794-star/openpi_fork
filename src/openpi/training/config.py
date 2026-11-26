@@ -369,6 +369,12 @@ class LeRobotMujocoPandaDataConfig(DataConfigFactory):
         assets_dirs: pathlib.Path,
         model_config: _model.BaseModelConfig,
     ) -> DataConfig:
+        if not self.dataset_root:
+            raise ValueError(
+                "Set MUJOCO_PANDA_DATA_ROOT to the converted LeRobot v2.1 pick directory. "
+                "See examples/mujoco_panda/README.md; the HF v3 export and Paper A Training Packs "
+                "cannot be passed directly to this configuration."
+            )
         # 将HF数据集字段名转换成MujocoPandaInputs期望的字段名。
         repack_transform = _transforms.Group(
             inputs=[
@@ -823,7 +829,7 @@ _CONFIGS = [
         ),
         # 使用我们的单臂Panda数据适配器。
         data=LeRobotMujocoPandaDataConfig(
-            repo_id="shuyisong07/merged_data",
+            repo_id="local/mujoco_panda_pick_v21",
             # 服务器以后通过环境变量告诉程序数据放在哪里。
             dataset_root=os.environ.get("MUJOCO_PANDA_DATA_ROOT"),
         ),

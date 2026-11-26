@@ -1,4 +1,5 @@
 from collections.abc import Iterator, Sequence
+import json
 import logging
 import multiprocessing
 import os
@@ -136,6 +137,30 @@ def create_torch_dataset(
         raise ValueError("Repo ID is not set. Cannot create dataset.")
     if repo_id == "fake":
         return FakeDataset(model_config, num_samples=1024)
+
+    if data_config.dataset_root is not None:
+        info_path = os.path.join(data_config.dataset_root, "meta", "info.json")
+        if not os.path.isfile(info_path):
+            raise ValueError(
+                f"No meta/info.json in {data_config.dataset_root}. Point dataset_root at a LeRobot dataset, "
+                "not the merged_data parent or a Paper A Training Pack."
+            )
+        with open(info_path, encoding="utf-8") as stream:
+            local_info = json.load(stream)
+        if str(local_info.get("codebase_version", "")).startswith("v3."):
+            raise ValueError(
+                f"Dataset format {local_info.get('codebase_version')} differs from the pinned reader "
+                f"{lerobot_dataset.CODEBASE_VERSION}. For the HF Panda pick v3 export, run "
+                "scripts/convert_mujoco_pick_v3_to_v21.py first; see examples/mujoco_panda/README.md."
+            )
+        conversion_path = os.path.join(data_config.dataset_root, "conversion.json")
+        if os.path.isfile(conversion_path):
+            with open(conversion_path, encoding="utf-8") as stream:
+                conversion = json.load(stream)
+            if conversion.get("complete") is not True:
+                raise ValueError("Pick dataset conversion is incomplete; do not train on this partial directory.")
+            if conversion.get("engineering_subset"):
+                logging.warning("Using an engineering subset of the pick dataset; this is not the full baseline.")
 
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(
         repo_id,
