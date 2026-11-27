@@ -15,7 +15,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from convert_mujoco_pick_v3_to_v21 import CAMERA, PickV3Source, convert, decode_frames
+from convert_mujoco_pick_v3_to_v21 import CAMERA, THREE_CAMERAS, THREE_VIEW_REPO_ID, PickV3Source, convert, decode_frames
 
 
 def video(path, colors):
@@ -101,6 +101,26 @@ class ConversionTest(unittest.TestCase):
         pq.write_table(pa.Table.from_pylist([{"task_index": 0, "task": "pick red cube"}]),
                        self.root / "meta/tasks.parquet")
 
+    def add_three_cameras(self):
+        self.info["video_path"] = "videos/{video_key}/file-{file_index:03d}.mkv"
+        for camera_index, camera in enumerate(THREE_CAMERAS):
+            self.info["features"][camera] = copy.deepcopy(self.info["features"][CAMERA])
+            folder = self.root / "videos" / camera
+            folder.mkdir(exist_ok=True)
+            # The third camera has its own video offset; frame-number-only
+            # synchronization would silently select the wrong observations.
+            padding = 2 if camera_index == 2 else 0
+            video(folder / "file-000.mkv", [0] * padding + [c + camera_index * 20 for c in (10, 80, 160)])
+            for episode in self.episodes:
+                prefix = f"videos/{camera}"
+                episode.update({
+                    f"{prefix}/chunk_index": 0, f"{prefix}/file_index": 0,
+                    f"{prefix}/from_timestamp": (episode["dataset_from_index"] + padding) / 30,
+                    f"{prefix}/to_timestamp": (episode["dataset_to_index"] + padding) / 30,
+                })
+        self.write_info()
+        self.write_tables()
+
     def test_conversion_preserves_episode_rows_pixels_and_units(self):
         output = Path(self.temp.name) / "converted"
         report = convert(PickV3Source(self.root), output, dataset_class=MemoryWriter)
@@ -145,9 +165,52 @@ class ConversionTest(unittest.TestCase):
         self.assertTrue(report["engineering_subset"])
         self.assertEqual(len(report["episodes"]), 1)
 
+    def test_export_uses_only_overview_when_source_has_three_cameras(self):
+        for key in ("observation.images.camera_2", "observation.images.camera_3"):
+            self.info["features"][key] = copy.deepcopy(self.info["features"][CAMERA])
+        self.write_info()
+        source = PickV3Source(self.root)
+        features = source.output_features()
+        self.assertEqual([key for key, feature in features.items() if feature["dtype"] == "image"], [CAMERA])
+        self.assertNotIn("observation.images.camera_2", features)
+        self.assertNotIn("observation.images.camera_3", features)
+
     def test_video_time_shift_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "mismatch"):
             list(decode_frames(self.root / "videos/file-000.mkv", 0.02, [0.0], 30))
+
+    def test_three_camera_conversion_uses_each_video_offset(self):
+        self.add_three_cameras()
+        report = convert(PickV3Source(self.root, three_views=True), Path(self.temp.name) / "three",
+                         dataset_class=MemoryWriter)
+        writer = MemoryWriter.last
+        self.assertEqual(writer.options["repo_id"], THREE_VIEW_REPO_ID)
+        self.assertEqual(report["cameras"], list(THREE_CAMERAS))
+        self.assertEqual([len(ep) for ep in writer.episodes], [2, 1])
+        for camera_index, camera in enumerate(THREE_CAMERAS):
+            self.assertEqual([int(f[camera][0, 0, 0]) for ep in writer.episodes for f in ep],
+                             [c + camera_index * 20 for c in (10, 80, 160)])
+            self.assertEqual(writer.options["features"][camera]["dtype"], "image")
+        self.assertEqual([float(f["action"][6]) for ep in writer.episodes for f in ep], [255, 0, 255])
+        self.assertTrue(report["complete"])
+
+    def test_three_camera_mode_requires_all_declared_views(self):
+        with self.assertRaisesRegex(ValueError, "camera_2"):
+            PickV3Source(self.root, three_views=True)
+
+    def test_three_camera_mode_rejects_missing_video_file(self):
+        self.add_three_cameras()
+        (self.root / "videos" / THREE_CAMERAS[2] / "file-000.mkv").unlink()
+        with self.assertRaisesRegex(FileNotFoundError, "camera_3"):
+            PickV3Source(self.root, three_views=True).validate()
+
+    def test_truncated_third_camera_does_not_mark_conversion_complete(self):
+        self.add_three_cameras()
+        video(self.root / "videos" / THREE_CAMERAS[2] / "file-000.mkv", [0, 0, 50])
+        output = Path(self.temp.name) / "truncated-three"
+        with self.assertRaisesRegex(ValueError, "Video ends"):
+            convert(PickV3Source(self.root, three_views=True), output, dataset_class=MemoryWriter)
+        self.assertFalse(json.loads((output / "conversion.json").read_text())["complete"])
 
 
 if __name__ == "__main__":

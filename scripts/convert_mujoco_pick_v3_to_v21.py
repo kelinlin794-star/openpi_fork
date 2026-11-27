@@ -1,7 +1,7 @@
 """Convert the historical HF Panda pick dataset to OpenPI's pinned LeRobot v2.1.
 
-Run with --help for arguments. Source files are never changed. Only overview RGB
-and numeric features are exported; other camera videos remain in the source.
+Run with --help for arguments. Source files are never changed. By default only
+overview RGB is exported; --three-views includes camera_2 and camera_3 as well.
 Decoded RGB is stored losslessly as embedded images, without another H.264 encode.
 The recorded same-row action labels, including gripper commands in 0..255, remain
 unchanged. This is NOT a Safe Stitch Training Pack importer.
@@ -13,6 +13,7 @@ import argparse
 import copy
 import hashlib
 import json
+from contextlib import ExitStack, closing
 from pathlib import Path
 
 import numpy as np
@@ -21,7 +22,9 @@ import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
 CAMERA = "observation.images.overview"
+THREE_CAMERAS = (CAMERA, "observation.images.camera_2", "observation.images.camera_3")
 REPO_ID = "local/mujoco_panda_pick_v21"
+THREE_VIEW_REPO_ID = "local/mujoco_panda_pick_3view_v21"
 HF_FOLDER = "act_dp_mujoco_panda_pick_20261022_hand_delta_ema"
 GENERATED = {"timestamp", "frame_index", "episode_index", "index", "task_index"}
 
@@ -38,7 +41,8 @@ def within(root: Path, relative: str) -> Path:
 
 
 class PickV3Source:
-    def __init__(self, root: Path):
+    def __init__(self, root: Path, *, three_views: bool = False):
+        self.cameras = THREE_CAMERAS if three_views else (CAMERA,)
         self.root = root.resolve()
         if not (self.root / "meta/info.json").is_file() and (self.root / HF_FOLDER).is_dir():
             self.root /= HF_FOLDER
@@ -58,8 +62,11 @@ class PickV3Source:
             action_names = action_names.get("axes", [])
         if not action_names or action_names[-1] != "gripper_target_0_255":
             raise ValueError("Expected raw 0..255 gripper labels; metric Training Packs must not use this converter.")
-        if features[CAMERA]["shape"] != [480, 640, 3]:
-            raise ValueError("Expected the original 480x640 overview RGB camera.")
+        for camera in self.cameras:
+            if camera not in features or features[camera]["shape"] != [480, 640, 3]:
+                raise ValueError(f"Expected the original 480x640 RGB camera: {camera}.")
+            if features[camera]["dtype"] != "video":
+                raise ValueError(f"Expected a source video feature: {camera}.")
         self.fps = self.info["fps"]
         episode_files = sorted((self.root / "meta/episodes").glob("chunk-*/*.parquet"))
         data_files = sorted((self.root / "data").glob("chunk-*/*.parquet"))
@@ -113,10 +120,10 @@ class PickV3Source:
             raise ValueError(f"Episode {index}: unknown task index.")
         return rows
 
-    def video(self, episode: dict) -> tuple[Path, float, float]:
-        prefix = f"videos/{CAMERA}"
+    def video(self, episode: dict, camera: str = CAMERA) -> tuple[Path, float, float]:
+        prefix = f"videos/{camera}"
         path = self.info["video_path"].format(
-            video_key=CAMERA,
+            video_key=camera,
             chunk_index=episode[f"{prefix}/chunk_index"],
             file_index=episode[f"{prefix}/file_index"],
         )
@@ -133,26 +140,29 @@ class PickV3Source:
             if episode["dataset_from_index"] != end:
                 raise ValueError("Episode ranges overlap or leave gaps.")
             end = episode["dataset_to_index"]
-            path, start, stop = self.video(episode)
-            if not np.isfinite([start, stop]).all() or start < 0:
-                raise ValueError("Invalid video time range.")
-            if not np.isclose(stop - start, episode["length"] / self.fps, atol=1e-4, rtol=0):
-                raise ValueError("Video time range differs from numeric frame count.")
-            if require_videos and not path.is_file():
-                raise FileNotFoundError(f"Download the original overview video first: {path}")
+            for camera in self.cameras:
+                path, start, stop = self.video(episode, camera)
+                if not np.isfinite([start, stop]).all() or start < 0:
+                    raise ValueError(f"Invalid video time range: {camera}.")
+                if not np.isclose(stop - start, episode["length"] / self.fps, atol=1e-4, rtol=0):
+                    raise ValueError(f"Video time range differs from numeric frame count: {camera}.")
+                if require_videos and not path.is_file():
+                    raise FileNotFoundError(f"Download the original {camera} video first: {path}")
         if end != self.data.num_rows:
             raise ValueError("Episode ranges do not cover the dataset.")
-        return {"episodes": len(self.episodes), "frames": end, "fps": self.fps, "gripper_unit": "0..255"}
+        return {"episodes": len(self.episodes), "frames": end, "fps": self.fps,
+                "gripper_unit": "0..255", "cameras": list(self.cameras)}
 
     def output_features(self) -> dict:
-        keys = [*self.numeric_keys, CAMERA]
+        keys = [*self.numeric_keys, *self.cameras]
         result = {key: copy.deepcopy(self.info["features"][key]) for key in keys}
         for feature in result.values():
             feature["shape"] = tuple(feature["shape"])
             if isinstance(feature.get("names"), dict):
                 feature["names"] = feature["names"]["axes"]
             feature.pop("info", None)
-        result[CAMERA]["dtype"] = "image"
+        for camera in self.cameras:
+            result[camera]["dtype"] = "image"
         return result
 
 
@@ -180,8 +190,10 @@ def decode_frames(path: Path, start: float, timestamps: list[float], fps: int):
             yield frame.to_ndarray(format="rgb24")
 
 
-def convert(source: PickV3Source, output: Path, *, repo_id: str = REPO_ID, max_episodes: int | None = None,
+def convert(source: PickV3Source, output: Path, *, repo_id: str | None = None, max_episodes: int | None = None,
             dataset_class=None) -> dict:
+    if repo_id is None:
+        repo_id = THREE_VIEW_REPO_ID if len(source.cameras) == 3 else REPO_ID
     output = output.resolve()
     if output.exists():
         raise FileExistsError(f"Refusing to overwrite existing output (including incomplete conversions): {output}")
@@ -205,7 +217,7 @@ def convert(source: PickV3Source, output: Path, *, repo_id: str = REPO_ID, max_e
         "complete": False, "source_root": str(source.root), "repo_id": repo_id,
         "source_info_sha256": hashlib.sha256((source.root / "meta/info.json").read_bytes()).hexdigest(),
         "source_format": "v3.0", "target_format": "v2.1", "action_alignment": "recorded-row-unchanged",
-        "gripper_unit": "0..255", "camera": CAMERA, "image_storage": "lossless embedded RGB images",
+        "gripper_unit": "0..255", "cameras": list(source.cameras), "image_storage": "lossless embedded RGB images",
         "engineering_subset": max_episodes is not None and max_episodes < len(source.episodes),
         "episodes": [],
     }
@@ -213,19 +225,25 @@ def convert(source: PickV3Source, output: Path, *, repo_id: str = REPO_ID, max_e
     report_path.write_text(json.dumps(provenance, indent=2), encoding="utf-8")
     for episode in source.episodes[:max_episodes]:
         rows = source.rows(episode)
-        path, start, _ = source.video(episode)
-        frames = decode_frames(path, start, [row["timestamp"] for row in rows], source.fps)
-        for row, image in zip(rows, frames, strict=True):
-            if image.shape != (480, 640, 3) or image.dtype != np.uint8:
-                raise ValueError("Decoded overview does not match the declared image shape/type.")
-            frame = {
-                key: np.asarray(row[key], dtype=source.info["features"][key]["dtype"]).reshape(
-                    source.info["features"][key]["shape"]
-                )
-                for key in source.numeric_keys
-            }
-            frame.update({CAMERA: image, "task": source.tasks[int(row["task_index"])]})
-            dataset.add_frame(frame)
+        timestamps = [row["timestamp"] for row in rows]
+        with ExitStack() as stack:
+            streams = []
+            for camera in source.cameras:
+                path, start, _ = source.video(episode, camera)
+                streams.append(stack.enter_context(closing(decode_frames(path, start, timestamps, source.fps))))
+            for row, *images in zip(rows, *streams, strict=True):
+                frame = {
+                    key: np.asarray(row[key], dtype=source.info["features"][key]["dtype"]).reshape(
+                        source.info["features"][key]["shape"]
+                    )
+                    for key in source.numeric_keys
+                }
+                for camera, image in zip(source.cameras, images, strict=True):
+                    if image.shape != (480, 640, 3) or image.dtype != np.uint8:
+                        raise ValueError(f"Decoded {camera} does not match the declared image shape/type.")
+                    frame[camera] = image
+                frame["task"] = source.tasks[int(row["task_index"])]
+                dataset.add_frame(frame)
         dataset.save_episode()
         provenance["episodes"].append({"source_episode_index": episode["episode_index"], "frames": len(rows)})
         report_path.write_text(json.dumps(provenance, indent=2), encoding="utf-8")
@@ -239,11 +257,12 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", type=Path, required=True, help="Local HF pick folder or its merged_data parent.")
     parser.add_argument("--output", type=Path, help="New, non-existing output directory; source is never overwritten.")
-    parser.add_argument("--repo-id", default=REPO_ID)
+    parser.add_argument("--repo-id", help="Defaults to a separate local repo ID for one- or three-view data.")
+    parser.add_argument("--three-views", action="store_true", help="Export overview, camera_2 and camera_3 together.")
     parser.add_argument("--max-episodes", type=int, help="Engineering smoke subset only; omit for the full dataset.")
     parser.add_argument("--inspect-only", action="store_true", help="Check all numeric rows and metadata without decoding.")
     args = parser.parse_args()
-    source = PickV3Source(args.source)
+    source = PickV3Source(args.source, three_views=args.three_views)
     if args.inspect_only:
         print(json.dumps(source.validate(require_videos=False), indent=2))
         print("Video decoding and the LeRobot writer have NOT been tested by inspect-only.")

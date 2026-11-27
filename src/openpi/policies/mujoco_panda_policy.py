@@ -10,6 +10,17 @@ GRIPPER_RAW_MAX = 255.0
 GRIPPER_MAX_WIDTH_M = 0.10
 STATE_DIM = 9
 ACTION_DIM = 7
+# Keep the original single-view experiment; the three-view experiment opts in.
+DATASET_IMAGE_KEY = "observation.images.overview"
+INPUT_IMAGE_KEY = "observation/overview"
+MODEL_IMAGE_KEY = "base_0_rgb"
+PADDING_IMAGE_KEYS = ("left_wrist_0_rgb", "right_wrist_0_rgb")
+IMAGE_KEY_MAPPING = (
+    (DATASET_IMAGE_KEY, INPUT_IMAGE_KEY, MODEL_IMAGE_KEY),
+    ("observation.images.camera_2", "observation/camera_2", "left_wrist_0_rgb"),
+    ("observation.images.camera_3", "observation/camera_3", "right_wrist_0_rgb"),
+)
+MODEL_IMAGE_KEYS = tuple(model_key for _, _, model_key in IMAGE_KEY_MAPPING)
 
 
 def _parse_image(image) -> np.ndarray:
@@ -55,35 +66,40 @@ def _convert_actions_to_metric(actions) -> np.ndarray:
 
 @dataclasses.dataclass(frozen=True)
 class MujocoPandaInputs(transforms.DataTransformFn):
-    """Convert the single-arm MuJoCo Panda data to the π0.5 format."""
+    """Single-arm S9/A7 input with one or three real external camera views.
+
+    By default only overview is valid. With three_views=True, camera_2 and
+    camera_3 fill the other official slots and all three masks are True.
+    The slot names do not describe the physical positions of these cameras.
+    Gesture labels are not model inputs.
+    """
+
+    three_views: bool = False
 
     def __call__(self, data: dict) -> dict:
-        base_image = _parse_image(data["observation/overview"])
+        mapping = IMAGE_KEY_MAPPING if self.three_views else IMAGE_KEY_MAPPING[:1]
+        missing = [input_key for _, input_key, _ in mapping if input_key not in data]
+        if missing:
+            raise ValueError(f"Missing required camera inputs: {missing}. Check the dataset and camera mapping.")
+        images = {model_key: _parse_image(data[input_key]) for _, input_key, model_key in mapping}
+        base_image = images[MODEL_IMAGE_KEY]
 
         state = np.asarray(
             data["observation/state"],
             dtype=np.float32,
         )
 
-        if state.shape[-1] != STATE_DIM:
+        if state.shape != (STATE_DIM,):
             raise ValueError(
-                f"Expected state shape [..., {STATE_DIM}], got {state.shape}"
+                f"Expected one single-arm state with shape ({STATE_DIM},), got {state.shape}"
             )
 
         blank_image = np.zeros_like(base_image)
 
         inputs = {
             "state": state,
-            "image": {
-                "base_0_rgb": base_image,
-                "left_wrist_0_rgb": blank_image,
-                "right_wrist_0_rgb": blank_image,
-            },
-            "image_mask": {
-                "base_0_rgb": np.True_,
-                "left_wrist_0_rgb": np.False_,
-                "right_wrist_0_rgb": np.False_,
-            },
+            "image": {key: images.get(key, blank_image) for key in MODEL_IMAGE_KEYS},
+            "image_mask": {key: np.bool_(key in images) for key in MODEL_IMAGE_KEYS},
         }
 
         # 训练时有actions，推理时没有。
@@ -132,10 +148,11 @@ class MujocoPandaOutputs(transforms.DataTransformFn):
 
 """
 完成的转换是
-overview
-  → base_0_rgb
+overview → base_0_rgb
+三视角模式：camera_2 → left_wrist_0_rgb，camera_3 → right_wrist_0_rgb
+三路都是外部相机，三路 mask=True；字段名沿用官方接口。
 
-没有腕部相机
+单视角模式下未使用的两个图像槽位
   → 两张黑图 + mask=False
 
 S9 state

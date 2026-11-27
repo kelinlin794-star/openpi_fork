@@ -361,7 +361,9 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
         )
 @dataclasses.dataclass(frozen=True)
 class LeRobotMujocoPandaDataConfig(DataConfigFactory):
-    """Data configuration for the single-arm MuJoCo Panda dataset."""
+    """Single-arm S9/A7 pick baseline with one or three real camera views."""
+
+    three_views: bool = False
 
     @override
     def create(
@@ -375,12 +377,15 @@ class LeRobotMujocoPandaDataConfig(DataConfigFactory):
                 "See examples/mujoco_panda/README.md; the HF v3 export and Paper A Training Packs "
                 "cannot be passed directly to this configuration."
             )
+        image_mapping = mujoco_panda_policy.IMAGE_KEY_MAPPING
+        if not self.three_views:
+            image_mapping = image_mapping[:1]
         # 将HF数据集字段名转换成MujocoPandaInputs期望的字段名。
         repack_transform = _transforms.Group(
             inputs=[
                 _transforms.RepackTransform(
                     {
-                        "observation/overview": "observation.images.overview",
+                        **{input_key: dataset_key for dataset_key, input_key, _ in image_mapping},
                         "observation/state": "observation.state",
                         "actions": "action",
                         "prompt": "prompt",
@@ -391,7 +396,7 @@ class LeRobotMujocoPandaDataConfig(DataConfigFactory):
 
         # 训练输入和推理输出使用你刚写的适配器。
         data_transforms = _transforms.Group(
-            inputs=[mujoco_panda_policy.MujocoPandaInputs()],
+            inputs=[mujoco_panda_policy.MujocoPandaInputs(three_views=self.three_views)],
             outputs=[mujoco_panda_policy.MujocoPandaOutputs()],
         )
 
@@ -827,7 +832,7 @@ _CONFIGS = [
             paligemma_variant="gemma_2b_lora",
             action_expert_variant="gemma_300m_lora",
         ),
-        # 使用我们的单臂Panda数据适配器。
+        # 单臂抓放：只输入 overview，不使用 camera_2 / camera_3 或手势标签。
         data=LeRobotMujocoPandaDataConfig(
             repo_id="local/mujoco_panda_pick_v21",
             # 服务器以后通过环境变量告诉程序数据放在哪里。
@@ -844,6 +849,30 @@ _CONFIGS = [
         ).get_freeze_filter(),
 
         # 与官方LoRA示例一致，关闭额外的EMA参数副本。
+        ema_decay=None,
+        num_train_steps=20_000,
+        batch_size=1,
+    ),
+    TrainConfig(
+        name="pi05_mujoco_panda_pick_3view",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotMujocoPandaDataConfig(
+            repo_id="local/mujoco_panda_pick_3view_v21",
+            dataset_root=os.environ.get("MUJOCO_PANDA_DATA_ROOT"),
+            three_views=True,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_base/params"
+        ),
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
         ema_decay=None,
         num_train_steps=20_000,
         batch_size=1,
