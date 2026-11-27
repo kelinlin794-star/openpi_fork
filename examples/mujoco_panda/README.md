@@ -73,7 +73,8 @@ checkpoint or tokenizer resource is not cached. Check the reader, GPU memory and
 loss with a **two-step test**, using a new experiment name if rerunning:
 
 ```bash
-WANDB_MODE=disabled XLA_PYTHON_CLIENT_PREALLOCATE=false \
+unset XLA_CLIENT_MEM_FRACTION
+WANDB_MODE=disabled XLA_PYTHON_CLIENT_PREALLOCATE=false XLA_PYTHON_CLIENT_MEM_FRACTION=0.95 \
 python scripts/train.py pi05_mujoco_panda_pick_3view \
   --exp-name pick_3view_smoke --num-train-steps 2 --log-interval 1 --num-workers 0
 ```
