@@ -33,6 +33,8 @@ this command reuses matching downloaded files and adds the missing cameras:
 
 ```bash
 source .venv/bin/activate
+# Use the persistent checkpoint/tokenizer cache prepared for this project.
+export OPENPI_DATA_HOME=/zhouhuayi/openpi-cache/openpi
 python - <<'PY'
 from huggingface_hub import snapshot_download
 folder = "act_dp_mujoco_panda_pick_20261022_hand_delta_ema"
